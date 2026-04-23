@@ -1,0 +1,778 @@
+---
+title: "Draft Mosaic Benchmark Database"
+author: "Adetola Abdulkadir"
+date: '`r Sys.Date()`'
+output: 
+    bookdown::html_document2:
+        toc: true
+        toc_float: true
+        df_print: paged
+        code_folding: hide
+---
+
+# Objective
+Creation of a database for the draft benchmark variants. This database includes performance of 4
+orthogonal methods: Duplex Sequencing, Element, BGI, and Pacbio HiFi. The database will also
+include annotations that categorize variants, highlight features (such as SomaticEVS), and help
+us identify which variants should be manually curated.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(knitr)
+library(stringr)
+library(dplyr)
+library(gt)
+library(Hmisc)
+```
+
+# Download and cleaning of the draft benchmark
+
+## Download
+```{r draft benchmark upload}
+here::i_am('scratch/draft_mosaic_benchmark.Rmd')
+draft_vcf <- read_tsv(here("data", "cand_put_mosaic_v0.0.3.FINAL.vcf"), comment = "##") %>%
+    rename(CHROM = `#CHROM`)
+# SEE README FOR DESCRIPTION ON BENCHMARK GENERATION
+```
+
+## Annotate variants
+```{r}
+var_type <- draft_vcf %>%
+    mutate(var_cat = case_when(
+        FILTER == "PASS" ~ "candidate",
+        TRUE             ~ "putative"),
+        .after = FILTER
+    ) %>%
+    mutate(
+        REF_len = nchar(REF),
+        ALT_len = nchar(ALT)
+    ) %>%
+    mutate(var_type = case_when(
+        REF_len == 1 & ALT_len == 1 ~ "snv",
+        REF_len == 1 & ALT_len > 1  ~ "indel",
+        REF_len > 1  & ALT_len == 1 ~ "indel",
+        REF_len > 1  & ALT_len > 1  ~ "MNP",
+        TRUE                         ~ "FIX_ME"
+    ), .after = var_cat) %>%
+    select(-ID, -QUAL)
+
+var_type %>%
+    group_by(var_cat, var_type) %>%
+    dplyr::summarize(n = n()) %>%
+    ungroup()
+
+snv_info_cols <- c("SOMATIC","QSS","TQSS","NT","QSS_NT","TQSS_NT",
+                   "SGT","DP","MQ","MQ0","ReadPosRankSum","SNVSB","SomaticEVS",
+                   "var_id","dup_var_hit","easy_to_map","homopolymer_region",
+                   "germline_insertion","germline_deletion")
+
+snv_fmt_value  <- "DP:FDP:SDP:SUBDP:AU:CU:GU:TU:GT"
+snv_fmt_cols   <- c("DPtier1","FDP","SDP","SUBDP","AU","CU","GU","TU","GT")
+snv_numeric_cols <- c("QSS","TQSS","QSS_NT","TQSS_NT","MQ","MQ0",
+                      "ReadPosRankSum","SNVSB","SomaticEVS","DP","FDP","SUBDP")
+
+draft_snvs <- draft_vcf %>%
+    filter(FORMAT == snv_fmt_value) %>%
+    separate(HG002, into = snv_fmt_cols,  sep = ":") %>%
+    separate(INFO,  into = snv_info_cols, sep = ";") %>%
+    select(-FORMAT, -ID, -QUAL) %>%
+    mutate(across(.cols = all_of(snv_info_cols),    str_remove, ".*=")) %>%
+    mutate(across(.cols = all_of(snv_numeric_cols), as.numeric)) %>%
+    left_join(var_type)
+```
+
+### Sanity check variant counts
+```{r}
+draft_snvs %>%
+    filter(var_cat == 'putative') %>%
+    mutate(SomaticEVS_Category = case_when(
+        SomaticEVS == 0 ~ '0_EVS',
+        SomaticEVS <= 1 ~ '0to1_EVS',
+        SomaticEVS <= 3 ~ '1to3_EVS',
+        SomaticEVS < 7  ~ '3to7_EVS',
+        TRUE            ~ '7plus_EVS'
+    )) %>%
+    group_by(SomaticEVS_Category) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = paste("Somatic EVS of Putative SNVs (Total n =",
+                             nrow(filter(draft_snvs, var_cat == 'putative')), ")"))
+
+draft_snvs %>%
+    group_by(var_cat) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = paste('Number of SNVs within Draft Benchmark (Total n =',
+                             nrow(draft_snvs), ')'))
+```
+
+## Calculating strelka AF for SNVs
+```{r}
+draft_snvs_af_df <- draft_snvs %>%
+    mutate(
+        refCounts = case_when(
+            REF == "A" ~ AU, REF == "C" ~ CU,
+            REF == "G" ~ GU, REF == "T" ~ TU,
+            TRUE        ~ "-1,-1"
+        ),
+        altCounts = case_when(
+            ALT == "A" ~ AU, ALT == "C" ~ CU,
+            ALT == "G" ~ GU, ALT == "T" ~ TU,
+            TRUE        ~ "-1,-1"
+        )
+    ) %>%
+    separate(refCounts, into = c("tier1RefCounts", "tier2RefCounts"), convert = TRUE) %>%
+    separate(altCounts, into = c("tier1AltCounts", "tier2AltCounts"), convert = TRUE) %>%
+    mutate(
+        AltCounts = if_else(TQSS_NT == 1, tier1AltCounts, tier2AltCounts),
+        RefCounts = if_else(TQSS_NT == 1, tier1RefCounts, tier2RefCounts),
+        AF        = AltCounts / (AltCounts + RefCounts)
+    ) %>%
+    select(CHROM, POS, var_type, var_cat, SomaticEVS, REF, ALT, AF,
+           var_id, dup_var_hit, easy_to_map, homopolymer_region,
+           germline_insertion, germline_deletion)
+```
+
+### Sanity Check variant counts
+```{r}
+draft_snvs_af_df %>%
+    mutate(VAF_Category = case_when(
+        AF == 0    ~ '0% VAF',
+        AF <= 0.01 ~ '0% - 1% VAF',
+        AF <= 0.04 ~ '1% - 4% VAF',
+        AF < 0.05  ~ '4% - 5% VAF',
+        AF < 0.1   ~ '5% - 10% VAF',
+        AF < 0.3   ~ '10% - 30% VAF',
+        TRUE       ~ '>30% VAF'
+    )) %>%
+    group_by(VAF_Category) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = 'Variant Allele Frequency (VAF) of SNVs')
+```
+
+## Calculating strelka AF for Indels
+```{r}
+indel_fmt_value    <- "DP:DP2:TAR:TIR:TOR:DP50:FDP50:SUBDP50:BCN50:GT"
+indel_fmt_cols     <- c("DP","DP2","TAR","TIR","TOR","DP50","FDP50","SUBDP50","BCN50","GT")
+indel_info_cols    <- c("SOMATIC","QSI","TQSI","NT","QSI_NT","TQSI_NT",
+                        "SGT","MQ","MQ0","RU","RC","IC","IHP","SomaticEVS",
+                        "var_id","dup_var_hit","easy_to_map","homopolymer_region",
+                        "germline_insertion","germline_deletion")
+indel_numeric_cols <- c("QSI","TQSI","QSI_NT","TQSI_NT","MQ","MQ0","RC","IC",
+                        "IHP","SomaticEVS","DP","DP2","DP50","FDP50","SUBDP50","BCN50")
+
+draft_indels <- draft_vcf %>%
+    filter(FORMAT == indel_fmt_value) %>%
+    separate(HG002, into = indel_fmt_cols,  sep = ":") %>%
+    separate(INFO,  into = indel_info_cols, sep = ";") %>%
+    select(-FORMAT) %>%
+    mutate(across(.cols = all_of(indel_info_cols),    str_remove, ".*=")) %>%
+    mutate(across(.cols = all_of(indel_numeric_cols), as.numeric)) %>%
+    left_join(var_type)
+```
+
+### Sanity check variant counts
+```{r}
+draft_indels %>%
+    filter(var_cat == 'putative') %>%
+    mutate(SomaticEVS_Category = case_when(
+        SomaticEVS == 0 ~ '0_EVS',
+        SomaticEVS <= 1 ~ '0to1_EVS',
+        SomaticEVS <= 3 ~ '1to3_EVS',
+        SomaticEVS < 7  ~ '3to7_EVS',
+        TRUE            ~ '7plus_EVS'
+    )) %>%
+    group_by(SomaticEVS_Category) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = paste('Somatic EVS of Putative Indels (Total n =',
+                             nrow(filter(draft_indels, var_cat == 'putative')), ')'))
+
+draft_indels %>%
+    group_by(var_cat) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = paste('Number of Indels within Draft Benchmark (Total n =',
+                             nrow(draft_indels), ')'))
+```
+
+## Continue indel AF calculation
+```{r}
+draft_indels_af_df <- draft_indels %>%
+    separate(TAR, into = c("tier1RefCounts", "tier2RefCounts"), convert = TRUE) %>%
+    separate(TIR, into = c("tier1AltCounts", "tier2AltCounts"), convert = TRUE) %>%
+    mutate(
+        AltCounts = if_else(TQSI_NT == 1, tier1AltCounts, tier2AltCounts),
+        RefCounts = if_else(TQSI_NT == 1, tier1RefCounts, tier2RefCounts),
+        AF        = AltCounts / (AltCounts + RefCounts),
+        total     = tier1AltCounts + tier2AltCounts + tier1RefCounts + tier2RefCounts
+    ) %>%
+    select(CHROM, POS, var_type, var_cat, SomaticEVS, REF, ALT, AF,
+           var_id, dup_var_hit, easy_to_map, homopolymer_region,
+           germline_insertion, germline_deletion) %>%
+    mutate(indel_change = case_when(
+        str_length(REF) > str_length(ALT) ~ str_c('-', str_remove(REF, ALT)),
+        str_length(REF) < str_length(ALT) ~ str_c('+', str_remove(ALT, REF))
+    ), .after = ALT)
+```
+
+### Sanity check
+```{r}
+draft_indels_af_df %>%
+    mutate(VAF_Category = case_when(
+        AF == 0    ~ '0% VAF',
+        AF <= 0.01 ~ '0% - 1% VAF',
+        AF <= 0.04 ~ '1% - 4% VAF',
+        AF < 0.05  ~ '4% - 5% VAF',
+        AF < 0.1   ~ '5% - 10% VAF',
+        AF < 0.3   ~ '10% - 30% VAF',
+        TRUE       ~ '>30% VAF'
+    )) %>%
+    group_by(VAF_Category) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = 'Variant Allele Frequency (VAF) of Indels')
+```
+
+## Combine indels and snvs
+```{r}
+draft_variants <- draft_indels_af_df %>%
+    select(-indel_change) %>%
+    {rbind(draft_snvs_af_df, .)} %>%
+    mutate(dup_var_hit = case_when(
+        var_id == 'hit' ~ 'hit',
+        TRUE            ~ dup_var_hit
+    )) %>%
+    mutate(var_id = case_when(
+        var_id == 'hit' ~ NA,
+        TRUE            ~ var_id
+    )) %>%
+    mutate(indel_change = case_when(
+        str_length(REF) > str_length(ALT) ~ str_c('-', str_remove(REF, ALT)),
+        str_length(REF) < str_length(ALT) ~ str_c('+', str_remove(ALT, REF))
+    ), .after = ALT)
+```
+
+# Including HG002 DupSeq data into the database
+
+## Downloading the HG002 Duplex Sequencing data
+```{r}
+mut_metadata <- read_tsv(here("data/dupseq-file-metadata.tsv"), comment = "#") %>%
+    filter(File_type == "mut" & grepl("GIAB-HG002", sample) == TRUE)
+mut_list <- as.list(mut_metadata$url) %>% set_names(mut_metadata$sample)
+```
+
+## Detecting benchmark variants within HG002
+```{r}
+tidy_and_annotate_mut <- function(filepath, target_metadata){
+    mut_tbl <- read_tsv(filepath)
+
+    mut_tbl <- mut_tbl %>%
+        select(contig, start, end, variation_type,
+               ref, alt, alt_depth, depth, no_calls, qual)
+
+    mut_tbl <- target_metadata %>%
+        rename(contig = CHROM) %>%
+        left_join(mut_tbl, by = join_by(contig, POS == end, REF == ref, ALT == alt))
+
+    return(mut_tbl)
+}
+
+HG002_mut_tbl <- mut_list %>%
+    map_dfr(tidy_and_annotate_mut, draft_variants, .id = "sample_id") %>%
+    mutate(MAF = alt_depth / (depth - no_calls)) %>%
+    mutate(method = "Duplex")
+
+HG002_mut_tbl_depth <- HG002_mut_tbl %>%
+    select(-variation_type, -alt_depth, -no_calls, -MAF, -qual, -start) %>%
+    pivot_wider(names_from = sample_id, values_from = depth)
+
+HG002_mut_tbl_VAF <- HG002_mut_tbl %>%
+    select(-variation_type, -depth, -alt_depth, -no_calls, -qual, -start) %>%
+    pivot_wider(names_from = sample_id, values_from = MAF)
+
+HG002_mut_tbl_combined <- HG002_mut_tbl %>%
+    select(-sample_id) %>%
+    rename('CHROM' = 'contig') %>%
+    group_by(CHROM, POS, var_type, var_cat, var_id, dup_var_hit, easy_to_map,
+             homopolymer_region, germline_insertion, germline_deletion,
+             SomaticEVS, REF, ALT, AF, method) %>%
+    summarise(
+        Duplex_alt_depth = sum(alt_depth, na.rm = TRUE),
+        Duplex_depth     = sum(depth,     na.rm = TRUE),
+        Duplex_no_calls  = sum(no_calls,  na.rm = TRUE),
+        Duplex_qual      = median(qual,   na.rm = TRUE),
+        .groups = 'drop'
+    ) %>%
+    mutate(Duplex_mut_freq = Duplex_alt_depth / (Duplex_depth - Duplex_no_calls)) %>%
+    mutate(Duplex_Lower_CI = binconf(Duplex_alt_depth, Duplex_depth - Duplex_no_calls, alpha = 0.10)[2]) %>%
+    mutate(Duplex_Upper_CI = binconf(Duplex_alt_depth, Duplex_depth - Duplex_no_calls, alpha = 0.10)[3])
+```
+
+# Downloading Orthogonal Data
+
+## Helper functions for tidy,annotating, and matching orthogonal variant data to benchmark
+```{r helpers}
+
+bam_readcount_col_types <- cols(
+    map_qual_A = 'd', map_qual_G = 'd', map_qual_T = 'd', map_qual_C = 'd',
+    base_qual_A = 'd', base_qual_G = 'd', base_qual_T = 'd', base_qual_C = 'd'
+)
+
+annotation_cols <- c("var_id","dup_var_hit","easy_to_map","homopolymer_region",
+                     "germline_insertion","germline_deletion")
+
+# Key columns shared across every platform output tibble.
+variant_key_cols <- c("CHROM","POS","var_type","var_cat","SomaticEVS","REF","ALT","AF",
+                      annotation_cols)
+
+tidy_and_annotate_orth_mut <- function(mut_tbl, target_metadata, mut_type) {
+
+    if (mut_type == 'snv') {
+        mut_tbl <- left_join(target_metadata, mut_tbl,
+                             by = c('CHROM' = 'chrom', 'POS' = 'position')) %>%
+            select(-ref_base, -alt_base) %>%
+            mutate(method_alt_depth = case_when(
+                ALT == 'A' ~ field_A, ALT == 'C' ~ field_C,
+                ALT == 'T' ~ field_T, ALT == 'G' ~ field_G
+            )) %>%
+            mutate(method_map_qual = case_when(
+                ALT == 'A' ~ map_qual_A, ALT == 'C' ~ map_qual_C,
+                ALT == 'T' ~ map_qual_T, ALT == 'G' ~ map_qual_G
+            )) %>%
+            mutate(method_base_qual = case_when(
+                ALT == 'A' ~ base_qual_A, ALT == 'C' ~ base_qual_C,
+                ALT == 'T' ~ base_qual_T, ALT == 'G' ~ base_qual_G
+            )) %>%
+            rename('method_depth' = 'depth') %>%
+            mutate(method_mut_freq = method_alt_depth / method_depth) %>%
+            select(-alt_depth)
+        return(mut_tbl)
+    }
+
+    if (mut_type == 'indel') {
+        mut_tbl <- left_join(target_metadata, mut_tbl,
+                             by = c('CHROM' = 'chrom', 'POS' = 'position'))
+
+        gathered_mut_tbl <- mut_tbl %>%
+            # gather() replaced with pivot_longer() (gather was deprecated in tidyr 1.0)
+            pivot_longer(
+                cols      = starts_with("field_indel"),
+                names_to  = "indel_column",
+                values_to = "indel_value"
+            ) %>%
+            separate(col  = 'indel_value',
+                     into = c('indel_type','indel_val','method_map_qual','method_base_qual'),
+                     sep  = ":") %>%
+            filter(indel_change == indel_type) %>%
+            select(-ref_base, -alt_base, -alt_depth, -mut_freq,
+                   -field_A, -field_G, -field_C, -field_T, -field_N,
+                   -indel_column, -indel_type,
+                   -map_qual_A, -map_qual_C, -map_qual_G, -map_qual_T,
+                   -base_qual_A, -base_qual_C, -base_qual_G, -base_qual_T) %>%
+            # Explicit join keys replace the original implicit right_join(target_metadata)
+            right_join(target_metadata, by = c("CHROM","POS","REF","ALT")) %>%
+            mutate(method_alt_depth  = as.numeric(indel_val)) %>%
+            rename('method_depth' = 'depth') %>%
+            mutate(method_mut_freq  = method_alt_depth / method_depth) %>%
+            select(-indel_val) %>%
+            mutate(method_map_qual  = as.numeric(method_map_qual),
+                   method_base_qual = as.numeric(method_base_qual))
+
+        return(gathered_mut_tbl)
+    }
+}
+
+read_and_annotate_platform <- function(filepath, target_metadata, mut_type,
+                                        platform_name, extra_col_types = cols()) {
+    col_spec <- modifyList(bam_readcount_col_types, extra_col_types)
+    read_tsv(filepath, col_types = col_spec) %>%
+        tidy_and_annotate_orth_mut(target_metadata, mut_type) %>%
+        rename_with(
+            ~ str_replace(., "^method_", paste0(platform_name, "_")),
+            starts_with("method_")
+        ) %>%
+        mutate(method = platform_name)
+}
+
+combine_platform_variants <- function(snv_target, indel_target, platform_name) {
+    p         <- platform_name
+    depth_col <- paste0(p, "_depth")
+    alt_col   <- paste0(p, "_alt_depth")
+    map_col   <- paste0(p, "_map_qual")
+    base_col  <- paste0(p, "_base_qual")
+    freq_col  <- paste0(p, "_mut_freq")
+    lower_col <- paste0(p, "_Lower_CI")
+    upper_col <- paste0(p, "_Upper_CI")
+
+    platform_cols <- c(depth_col, alt_col, map_col, base_col, freq_col)
+
+    combined <- bind_rows(
+        select(snv_target,   all_of(c(variant_key_cols, platform_cols, "method"))),
+        select(indel_target, all_of(c(variant_key_cols, platform_cols, "method")))
+    ) %>%
+        mutate(
+            .x_tmp = coalesce(.data[[alt_col]],   0),
+            .n_tmp = coalesce(.data[[depth_col]], 0)
+        )
+
+    ci <- binconf(combined$.x_tmp, combined$.n_tmp, alpha = 0.10)
+
+    combined %>%
+        bind_cols(as_tibble(ci)) %>%
+        rename(!!lower_col := Lower, !!upper_col := Upper) %>%
+        select(-.x_tmp, -.n_tmp, -PointEst) %>%
+        mutate(index = row_number())
+}
+
+summarise_reads <- function(..., platform_name) {
+    p         <- platform_name
+    alt_col   <- paste0(p, "_alt_depth")
+    depth_col <- paste0(p, "_depth")
+    map_col   <- paste0(p, "_map_qual")
+    base_col  <- paste0(p, "_base_qual")
+    freq_col  <- paste0(p, "_mut_freq")
+
+    bind_rows(...) %>%
+        mutate(method = platform_name) %>%
+        group_by(across(all_of(c(variant_key_cols, "method")))) %>%
+        summarise(
+            !!alt_col   := sum(.data[[alt_col]],       na.rm = TRUE),
+            !!depth_col := sum(.data[[depth_col]],     na.rm = TRUE),
+            !!map_col   := median(.data[[map_col]],    na.rm = TRUE),
+            !!base_col  := median(.data[[base_col]],   na.rm = TRUE),
+            .groups     = 'drop'
+        ) %>%
+        mutate(!!freq_col := .data[[alt_col]] / .data[[depth_col]])
+}
+
+rename_platform_prefix <- function(tbl, from, to) {
+    tbl %>% rename_with(
+        ~ str_replace(., paste0("^", from, "_"), paste0(to, "_")),
+        starts_with(paste0(from, "_"))
+    )
+}
+```
+
+## Downloading BGI Data
+```{r}
+BGI_snv_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","BGI_RM_snv.tsv"),
+    draft_snvs_af_df, 'snv', 'BGI'
+)
+BGI_indel_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","BGI_RM_indel.tsv"),
+    draft_indels_af_df, 'indel', 'BGI'
+)
+BGI_variants_target <- combine_platform_variants(BGI_snv_target, BGI_indel_target, 'BGI')
+```
+
+## Downloading Element Data
+```{r}
+Element_snv_standard_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Element_RM_snv_standard.tsv"),
+    draft_snvs_af_df, 'snv', 'Element'
+)
+Element_snv_long_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Element_RM_snv_long.tsv"),
+    draft_snvs_af_df, 'snv', 'Element'
+)
+Element_indel_standard_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Element_RM_indel_standard.tsv"),
+    draft_indels_af_df, 'indel', 'Element'
+)
+Element_indel_long_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Element_RM_indel_long.tsv"),
+    draft_indels_af_df, 'indel', 'Element'
+)
+
+# Combined across standard and long reads
+Element_snv_combined   <- summarise_reads(Element_snv_standard_target, Element_snv_long_target,
+                                          platform_name = 'Element')
+Element_indel_combined <- summarise_reads(Element_indel_standard_target, Element_indel_long_target,
+                                          platform_name = 'Element')
+Element_variants_target_combined <- combine_platform_variants(
+    Element_snv_combined, Element_indel_combined, 'Element'
+)
+
+# Sub-instrument views (standard and long read sets separately)
+Element_variants_target_combined_long <- combine_platform_variants(
+    rename_platform_prefix(Element_snv_long_target,   "Element", "Element_long"),
+    rename_platform_prefix(Element_indel_long_target, "Element", "Element_long"),
+    'Element_long'
+)
+Element_variants_target_combined_standard <- combine_platform_variants(
+    rename_platform_prefix(Element_snv_standard_target,   "Element", "Element_standard"),
+    rename_platform_prefix(Element_indel_standard_target, "Element", "Element_standard"),
+    'Element_standard'
+)
+```
+
+## Downloading Pacbio Data
+```{r}
+# Extra col types specific to Revio indel files
+revio_indel_extra <- cols(position = 'd', alt_depth = 'd', depth = 'd',
+                          mut_freq = 'd', field_A = 'd')
+
+Pacbio_revio_snv_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_revio_snv.tsv"),
+    draft_snvs_af_df, 'snv', 'Pacbio'
+)
+Pacbio_revio_indel_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_revio_indel.tsv"),
+    draft_indels_af_df, 'indel', 'Pacbio',
+    extra_col_types = revio_indel_extra
+)
+Pacbio_sequel_snv_A_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_sequel_snv_A.tsv"),
+    draft_snvs_af_df, 'snv', 'Pacbio'
+)
+Pacbio_sequel_snv_B_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_sequel_snv_B.tsv"),
+    draft_snvs_af_df, 'snv', 'Pacbio'
+)
+Pacbio_sequel_indel_A_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_sequel_indel_A.tsv"),
+    draft_indels_af_df, 'indel', 'Pacbio'
+)
+Pacbio_sequel_indel_B_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Pacbio_RM_sequel_indel_B.tsv"),
+    draft_indels_af_df, 'indel', 'Pacbio'
+)
+
+# All instruments combined
+Pacbio_snv_combined <- summarise_reads(
+    Pacbio_revio_snv_target, Pacbio_sequel_snv_A_target, Pacbio_sequel_snv_B_target,
+    platform_name = 'Pacbio'
+)
+Pacbio_indel_combined <- summarise_reads(
+    Pacbio_revio_indel_target, Pacbio_sequel_indel_A_target, Pacbio_sequel_indel_B_target,
+    platform_name = 'Pacbio'
+)
+Pacbio_variants_target_combined <- combine_platform_variants(
+    Pacbio_snv_combined, Pacbio_indel_combined, 'Pacbio'
+)
+
+# Sub-instrument: Revio only
+Pacbio_variants_target_combined_revio <- combine_platform_variants(
+    rename_platform_prefix(Pacbio_revio_snv_target,   "Pacbio", "Pacbio_revio"),
+    rename_platform_prefix(Pacbio_revio_indel_target, "Pacbio", "Pacbio_revio"),
+    'Pacbio_revio'
+)
+
+# Sub-instrument: Sequel (A + B combined)
+Pacbio_snv_sequel_combined <- summarise_reads(
+    rename_platform_prefix(Pacbio_sequel_snv_A_target, "Pacbio", "Pacbio_sequel"),
+    rename_platform_prefix(Pacbio_sequel_snv_B_target, "Pacbio", "Pacbio_sequel"),
+    platform_name = 'Pacbio_sequel'
+)
+Pacbio_indel_sequel_combined <- summarise_reads(
+    rename_platform_prefix(Pacbio_sequel_indel_A_target, "Pacbio", "Pacbio_sequel"),
+    rename_platform_prefix(Pacbio_sequel_indel_B_target, "Pacbio", "Pacbio_sequel"),
+    platform_name = 'Pacbio_sequel'
+)
+Pacbio_variants_target_combined_sequel <- combine_platform_variants(
+    Pacbio_snv_sequel_combined, Pacbio_indel_sequel_combined, 'Pacbio_sequel'
+)
+```
+
+## Downloading Illumina Data
+```{r}
+illumina_indel_extra <- cols(position = 'd', alt_depth = 'd', depth = 'd', mut_freq = 'd')
+
+Illumina_snv_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Illumina_RM_snv.tsv"),
+    draft_snvs_af_df, 'snv', 'Illumina'
+)
+Illumina_indel_target <- read_and_annotate_platform(
+    here("scratch","bam_readcount","Illumina_RM_indel.tsv"),
+    draft_indels_af_df, 'indel', 'Illumina',
+    extra_col_types = illumina_indel_extra
+)
+Illumina_variants_target <- combine_platform_variants(
+    Illumina_snv_target, Illumina_indel_target, 'Illumina'
+)
+```
+
+# Ortho Database with check for germline indels among benchmark; as well as characteristics of V3 database
+```{r}
+drop_join_redundancies <- function(tbl) {
+    tbl %>% select(-all_of(annotation_cols), -method, -index)
+}
+
+mosaic_variant_database_RM <- draft_variants %>%
+    left_join(
+        HG002_mut_tbl_combined %>%
+            select(CHROM, POS, REF, ALT, Duplex_depth, Duplex_alt_depth,
+                   Duplex_mut_freq, Duplex_qual, Duplex_Lower_CI, Duplex_Upper_CI),
+        by = c('CHROM','POS','REF','ALT')
+    ) %>%
+    left_join(drop_join_redundancies(BGI_variants_target),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Element_variants_target_combined),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Element_variants_target_combined_long),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Element_variants_target_combined_standard),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Pacbio_variants_target_combined),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Pacbio_variants_target_combined_revio),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Pacbio_variants_target_combined_sequel),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    left_join(drop_join_redundancies(Illumina_variants_target),
+              by = c('CHROM','POS','REF','ALT')) %>%
+    relocate(var_type, var_cat, SomaticEVS, AF, var_id, dup_var_hit, easy_to_map,
+             homopolymer_region, germline_insertion, germline_deletion, .after = indel_change) %>%
+    mutate(VAF_Category = case_when(
+        AF == 0    ~ '0% VAF',
+        AF <= 0.01 ~ '0% - 1% VAF',
+        AF <= 0.04 ~ '1% - 4% VAF',
+        AF < 0.05  ~ '4% - 5% VAF',
+        AF < 0.1   ~ '5% - 10% VAF',
+        AF < 0.3   ~ '10% - 30% VAF',
+        TRUE       ~ '>30% VAF'
+    )) %>%
+    mutate(SomaticEVS_Category = case_when(
+        SomaticEVS == 0 ~ '0_EVS',
+        SomaticEVS <= 1 ~ '0to1_EVS',
+        SomaticEVS <= 3 ~ '1to3_EVS',
+        SomaticEVS < 7  ~ '3to7_EVS',
+        TRUE            ~ '7plus_EVS'
+    )) %>%
+    mutate(Genomic_Context = case_when(
+        easy_to_map == 'hit'               & homopolymer_region == 'hit'                      ~ "Easy to Map Region AND Homopolymer Region",
+        easy_to_map == 'hit'               & homopolymer_region == 'homopolymer_region_no_hit' ~ "Easy to Map Region BUT Non-Homopolymer Region",
+        easy_to_map == 'easy_to_map_no_hit'& homopolymer_region == 'hit'                      ~ "Homopolymer Region BUT Not Easy to Map Region",
+        TRUE ~ "Non-Homopolymer Region AND Not Easy to Map Region"
+    )) %>%
+    mutate(Germline_Indel_Check = case_when(
+        germline_insertion == 'hit' & germline_deletion != "hit" ~ "Insertion_Overlap",
+        germline_insertion != 'hit' & germline_deletion == "hit" ~ "Deletion_Overlap",
+        germline_insertion == 'hit' & germline_deletion == "hit" ~ "ERROR",
+        TRUE ~ "No_Overlap"
+    )) %>%
+    mutate(Coverage_Category_Duplex = case_when(
+        Duplex_depth < 100                     ~ '<100X',
+        Duplex_depth < 300 & SomaticEVS >= 100 ~ '100X-300X',
+        TRUE                                   ~ '>300X'
+    )) %>%
+    
+    mutate(Duplex_Presence   = if_else(Duplex_alt_depth   > 1 & !is.na(Duplex_mut_freq),   'TRUE', 'FALSE')) %>%
+    mutate(Element_Presence  = if_else(Element_alt_depth  > 1 & !is.na(Element_mut_freq),  'TRUE', 'FALSE')) %>%
+    mutate(BGI_Presence      = if_else(BGI_alt_depth      > 1 & !is.na(BGI_mut_freq),      'TRUE', 'FALSE')) %>%
+    mutate(Pacbio_Presence   = if_else(Pacbio_alt_depth   > 1 & !is.na(Pacbio_mut_freq),   'TRUE', 'FALSE')) %>%
+    mutate(Illumina_Presence = if_else(Illumina_alt_depth > 1 & !is.na(Illumina_mut_freq), 'TRUE', 'FALSE')) %>%
+    
+    mutate(Detection_Category = pmap_chr(
+        list(Illumina_Presence, Duplex_Presence, Element_Presence, BGI_Presence, Pacbio_Presence),
+        function(ill, dup, ele, bgi, pac) {
+            methods  <- c(Illumina = ill, Duplex = dup, Element = ele, BGI = bgi, Pacbio = pac)
+            detected <- names(methods[methods == 'TRUE'])
+            if      (length(detected) == 0) 'NONE'
+            else if (length(detected) == 5) 'ALL'
+            else    paste(detected, collapse = ',')
+        }
+    )) %>%
+    relocate(VAF_Category, SomaticEVS_Category, Coverage_Category_Duplex,
+             Genomic_Context, Detection_Category, .after = dup_var_hit) %>%
+    mutate(
+        x_ci        = rowSums(select(., Illumina_alt_depth, Duplex_alt_depth, BGI_alt_depth,
+                                     Element_alt_depth, Pacbio_alt_depth), na.rm = TRUE),
+        n_ci        = rowSums(select(., Illumina_depth, Duplex_depth, BGI_depth,
+                                     Element_depth, Pacbio_depth), na.rm = TRUE),
+        x_ci_no_Dup = rowSums(select(., Illumina_alt_depth, BGI_alt_depth,
+                                     Element_alt_depth, Pacbio_alt_depth), na.rm = TRUE),
+        n_ci_no_Dup = rowSums(select(., Illumina_depth, BGI_depth,
+                                     Element_depth, Pacbio_depth), na.rm = TRUE)
+    )
+
+mosaic_variant_database_RM <- mosaic_variant_database_RM %>%
+    cbind(binconf(mosaic_variant_database_RM$x_ci, mosaic_variant_database_RM$n_ci, 0.02)) %>%
+    rename(Orthogonal_Lower_CI = Lower, Orthogonal_Upper_CI = Upper) %>%
+    select(-PointEst)
+
+mosaic_variant_database_RM <- mosaic_variant_database_RM %>%
+    cbind(binconf(mosaic_variant_database_RM$x_ci_no_Dup, mosaic_variant_database_RM$n_ci_no_Dup, 0.02)) %>%
+    rename(Ortho_NO_DUP_Lower_CI = Lower, Ortho_NO_DUP_Upper_CI = Upper) %>%
+    select(-PointEst)
+
+mosaic_variant_database_RM <- mosaic_variant_database_RM %>%
+    mutate(Overlap_Check = case_when(
+        Orthogonal_Upper_CI >  Ortho_NO_DUP_Upper_CI & Ortho_NO_DUP_Upper_CI > Orthogonal_Lower_CI  ~ 'Overlap_Detected',
+        Orthogonal_Upper_CI <  Ortho_NO_DUP_Upper_CI & Orthogonal_Upper_CI   > Ortho_NO_DUP_Lower_CI ~ 'Overlap_Detected',
+        Orthogonal_Upper_CI == Ortho_NO_DUP_Upper_CI & Orthogonal_Lower_CI  == Ortho_NO_DUP_Lower_CI ~ 'Overlap_Detected',
+        Orthogonal_Upper_CI == 'NaN' & Ortho_NO_DUP_Upper_CI == 'NaN' ~ 'NA',
+        TRUE ~ 'No_Overlap'
+    )) %>%
+    mutate(Ortho_CI_Flag   = if_else(AF >= Orthogonal_Lower_CI    & AF <= Orthogonal_Upper_CI,    'PASS', 'FAIL')) %>%
+    mutate(NonDup_CI_Flag  = if_else(AF >= Ortho_NO_DUP_Lower_CI  & AF <= Ortho_NO_DUP_Upper_CI,  'PASS', 'FAIL'))
+
+write_tsv(mosaic_variant_database_RM, here('scratch','mosaic_variant_database_RM.tsv'))
+```
+
+### Sanity Check of Databases
+```{r}
+mosaic_variant_database_RM %>%
+    group_by(Detection_Category) %>%
+    summarise(n = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark SNV detection (Cutoffs: Alt_Depth, Mapping Quality, Base Quality)')
+
+mosaic_variant_database_RM %>%
+    filter(var_cat == 'candidate') %>%
+    group_by(Ortho_CI_Flag) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark Orthogonal CI Check: Candidate Variants')
+
+mosaic_variant_database_RM %>%
+    filter(var_cat == 'putative') %>%
+    group_by(Ortho_CI_Flag) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark Orthogonal CI Check: Putative Variants')
+
+mosaic_variant_database_RM %>%
+    filter(var_cat == 'candidate') %>%
+    group_by(NonDup_CI_Flag) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark NonDuplex Orthogonal CI Check: Candidate Variants')
+
+mosaic_variant_database_RM %>%
+    filter(var_cat == 'putative') %>%
+    group_by(NonDup_CI_Flag) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark NonDuplex Orthogonal CI Check: Putative Variants')
+
+mosaic_variant_database_RM %>%
+    filter(NonDup_CI_Flag == 'FAIL') %>%
+    group_by(Detection_Category) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark NonDuplex Orthogonal CI Check: FAILURES')
+
+mosaic_variant_database_RM %>%
+    filter(Ortho_CI_Flag == 'FAIL') %>%
+    group_by(Detection_Category) %>%
+    dplyr::summarise(count = n()) %>%
+    gt() %>%
+    tab_header(title = 'RM Benchmark Orthogonal CI Check: FAILURES')
+
+mosaic_variant_database_RM %>%
+    group_by(Detection_Category, VAF_Category, Genomic_Context, var_cat, var_type) %>%
+    dplyr::summarize(n = n()) %>%
+    write_tsv(here('scratch','RM_benchmark_detection_orth_method_genomic_context.tsv'))
+
+mosaic_variant_database_RM %>%
+    group_by(Genomic_Context) %>%
+    dplyr::summarize(n = n()) %>%
+    gt() %>%
+    tab_header(title = 'Benchmark SNV detection (alt depth > 1)')
+```
